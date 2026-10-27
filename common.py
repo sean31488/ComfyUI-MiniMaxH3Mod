@@ -43,9 +43,9 @@ def list_media_files(folder: str) -> Tuple[List[str], List[str]]:
 def load_image_file(path: str, max_edge: Optional[int] = None) -> torch.Tensor:
     """Load one image file -> [1, H, W, 3] float32 in [0, 1]."""
     import numpy as np
-    from PIL import Image
+    from PIL import Image, ImageOps
     with Image.open(path) as img:
-        img = img.convert("RGB")
+        img = ImageOps.exif_transpose(img).convert("RGB")
         w, h = img.size
         if max_edge is not None:
             scale = min(1.0, max_edge / max(w, h))

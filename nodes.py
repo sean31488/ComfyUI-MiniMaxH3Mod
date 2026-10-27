@@ -1515,6 +1515,22 @@ class MiniMaxH3RefModFolderLoader:
         return (refs, len(refs))
 
 
+class MiniMaxH3RefModImageBatch:
+    """Split an IMAGE batch into one ref per frame for the refs_bundle input."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",)}}
+
+    RETURN_TYPES = ("H3_REF_LIST",)
+    RETURN_NAMES = ("refs",)
+    FUNCTION = "split"
+    CATEGORY = "MiniMax-H3/mod"
+
+    def split(self, images):
+        return ([images[i:i + 1] for i in range(images.shape[0])],)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Node: MiniMaxH3RefModExtract (V3 — Autogrow reference inputs)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2354,6 +2370,101 @@ class MiniMaxH3RefModMasterExtract(io.ComfyNode):
         return io.NodeOutput(mods, details, ui=ui.PreviewText(details))
 
 
+class MiniMaxH3RefModFolderExtract(io.ComfyNode):
+    """One unsaved Full Reference mod per image in a folder."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3RefModFolderExtract",
+            display_name="Create H3 RefMods From Folder",
+            category="MiniMax-H3/mod",
+            description="Encode every image in a folder as its own unsaved Full Reference mod, ordered by filename. "
+                        "An empty folder field or a folder without images outputs no mods.",
+            inputs=[
+                io.String.Input("folder", default="",
+                    tooltip="Absolute path or a folder name inside input/. Empty = no references."),
+                io.Vae.Input("vae"),
+                io.Int.Input("ref_resolution", default=1024, min=256, max=2048, step=64,
+                    tooltip="Target short edge in px (downscale only)."),
+                io.Int.Input("max_tokens", default=5120, min=0, max=2147483647, step=512,
+                    tooltip="Token cap per image; 0 = no cap."),
+            ],
+            outputs=[
+                io.Custom("H3_REF_MODS").Output("mods"),
+                io.Image.Output("images", tooltip="The resized references in mod order, centered and black-padded to the largest width/height."),
+            ],
+        )
+
+    @classmethod
+    def _images(cls, folder):
+        if not folder.strip():
+            return []
+        return list_media_files(_resolve_folder(folder))[0]
+
+    @classmethod
+    def validate_inputs(cls, folder):
+        try:
+            cls._images(folder)
+        except ValueError as exc:
+            return str(exc)
+        return True
+
+    @classmethod
+    def fingerprint_inputs(cls, folder, **kwargs):
+        parts = []
+        for p in cls._images(folder):
+            st = os.stat(p)
+            parts.append(f"{os.path.basename(p)}:{st.st_size}:{int(st.st_mtime)}")
+        return "|".join(parts)
+
+    @classmethod
+    def execute(cls, folder, vae, ref_resolution=1024, max_tokens=5120) -> io.NodeOutput:
+        mods, frames = [], []
+        for p in cls._images(folder):
+            image = load_image_file(p)
+            mods.extend(MiniMaxH3RefModExtract.execute(
+                name=os.path.splitext(os.path.basename(p))[0], mode="encode",
+                refs_image={"ref_image_1": image}, vae=vae,
+                ref_resolution=ref_resolution, identity=0, max_tokens=max_tokens, save=False)[0])
+            frames.append(_resize_ref(image, ref_resolution))
+        if frames:
+            h = max(f.shape[1] for f in frames)
+            w = max(f.shape[2] for f in frames)
+            images = torch.cat([F.pad(f, (0, 0, (w - f.shape[2]) // 2, (w - f.shape[2] + 1) // 2,
+                                          (h - f.shape[1]) // 2, (h - f.shape[1] + 1) // 2)) for f in frames])
+        else:
+            images = torch.zeros((0, 64, 64, 3))
+        print(f"[MiniMaxH3RefModFolderExtract] {len(mods)} image mods from {folder!r}")
+        return io.NodeOutput(mods, images)
+
+
+class MiniMaxH3RefModsCombine(io.ComfyNode):
+    """Concatenate RefMod bundles in input order, e.g. several unsaved Create outputs."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3RefModsCombine",
+            display_name="Combine H3 RefMods",
+            category="MiniMax-H3/mod",
+            description="Concatenate RefMod bundles in input order. Text Encode numbers them in this order.",
+            inputs=[
+                io.Autogrow.Input("mods", template=io.Autogrow.TemplatePrefix(
+                    input=io.Custom("H3_REF_MODS").Input("mods"), prefix="mods_", min=0, max=16)),
+            ],
+            outputs=[io.Custom("H3_REF_MODS").Output("mods")],
+        )
+
+    @classmethod
+    def execute(cls, mods) -> io.NodeOutput:
+        out = []
+        for key in sorted(mods, key=lambda k: int(k.rsplit("_", 1)[1])):
+            if mods[key] is not None:
+                out.extend(mods[key])
+        return io.NodeOutput(out)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3RefModMaskList": MiniMaxH3RefModMaskList,
     "MiniMaxH3RefModBundleSave": MiniMaxH3RefModBundleSave,
@@ -2364,6 +2475,9 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3RefModAudioExtract": MiniMaxH3RefModAudioExtract,
     "MiniMaxH3RefModExtract": MiniMaxH3RefModExtract,
     "MiniMaxH3RefModFolderLoader": MiniMaxH3RefModFolderLoader,
+    "MiniMaxH3RefModFolderExtract": MiniMaxH3RefModFolderExtract,
+    "MiniMaxH3RefModImageBatch": MiniMaxH3RefModImageBatch,
+    "MiniMaxH3RefModsCombine": MiniMaxH3RefModsCombine,
     "MiniMaxH3RefModsLoader": MiniMaxH3RefModsLoader,
     "MiniMaxH3RefModsAxis": MiniMaxH3RefModsAxis,
     "MiniMaxH3RefModApply": MiniMaxH3RefModApply,
@@ -2383,6 +2497,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3RefModAudioExtract": "Create H3 Audio RefMod",
     "MiniMaxH3RefModExtract": "Create H3 RefMod",
     "MiniMaxH3RefModFolderLoader": "Load H3 RefMod Folder",
+    "MiniMaxH3RefModFolderExtract": "Create H3 RefMods From Folder",
+    "MiniMaxH3RefModImageBatch": "Split H3 RefMod Image Batch",
+    "MiniMaxH3RefModsCombine": "Combine H3 RefMods",
     "MiniMaxH3RefModsLoader": "Load H3 RefMods",
     "MiniMaxH3RefModsAxis": "Load H3 RefMod Axis",
     "MiniMaxH3RefModApply": "Apply H3 RefMod",
